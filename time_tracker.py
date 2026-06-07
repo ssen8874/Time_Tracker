@@ -54,7 +54,21 @@ SHEET_HEADER_RANGE = "A1:G1"
 
 @st.cache_resource
 def get_gspread_client():
-    return gspread.service_account(filename=SECRETS_PATH, scopes=SCOPES)
+    """
+    [하이브리드 인증 모듈]
+    1순위: Streamlit Cloud의 금고(st.secrets)에서 인증 키 탐색
+    2순위: 로컬 PC의 물리적 파일(secrets.json) 탐색
+    """
+    try:
+        # Streamlit Cloud 환경 우선 탐색
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        # 환경에 따른 이스케이프 문자(줄바꿈) 붕괴 방지 처리
+        if "\\n" in creds_dict.get("private_key", ""):
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        return gspread.service_account_from_dict(creds_dict, scopes=SCOPES)
+    except Exception:
+        # 로컬 환경으로 Fallback (예외 발생 시 기존 secrets.json 사용)
+        return gspread.service_account(filename=SECRETS_PATH, scopes=SCOPES)
 
 
 @st.cache_resource
@@ -167,7 +181,7 @@ def get_month_week_info(record_date: date) -> tuple[int, int, int, str]:
             month = 12
         else:
             month -= 1
-        first_ws = first_week_start_of_month(year, month)
+            first_ws = first_week_start_of_month(year, month)
 
     week_number = (week_start - first_ws).days // 7 + 1
     month_week_label = f"{month}월 {week_number}주차"
