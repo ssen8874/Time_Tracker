@@ -722,7 +722,9 @@ def build_modification_record_options(filtered_df: pd.DataFrame) -> list[tuple[s
 
 
 def render_modification_request_form(filtered_df: pd.DataFrame) -> None:
-    with st.expander("📝 근무 기록 수정 요청 (관리자 승인)"):
+    st.subheader("📝 근무 기록 수정 요청 (관리자 승인)")
+
+    with st.container(border=True):
         record_options = build_modification_record_options(filtered_df)
         if not record_options:
             st.caption("현재 필터 조건에 수정 요청 가능한 근무 기록이 없습니다.")
