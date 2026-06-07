@@ -32,7 +32,7 @@ SCOPES = [
 ]
 
 SHEET_COLUMNS = [
-    "월",
+    "연월",
     "월 주차",
     "날짜",
     "출근시간",
@@ -40,7 +40,7 @@ SHEET_COLUMNS = [
     "당일 근무시간",
     "업무 내용",
 ]
-# UI 표시 전용 — SHEET_COLUMNS(백엔드/시트)와 분리, '월'은 화면에서만 숨김
+# UI 표시 전용 — SHEET_COLUMNS(백엔드/시트)와 분리, '연월'은 화면에서만 숨김
 DISPLAY_COLUMNS = [
     "월 주차",
     "날짜",
@@ -49,7 +49,7 @@ DISPLAY_COLUMNS = [
     "당일 근무시간",
     "업무 내용",
 ]
-INTERNAL_COLUMNS = ["연도", "주차", "_week_start", "_sort_date", "_sheet_row"]
+INTERNAL_COLUMNS = ["연도", "월", "주차", "_week_start", "_sort_date", "_sheet_row"]
 SHEET_HEADER_RANGE = "A1:G1"
 MODIFICATION_REQUEST_COLUMNS = [
     "요청 일시",
@@ -187,6 +187,10 @@ def format_time_short(value) -> str:
 
 def request_datetime_str() -> str:
     return now_kst().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_year_month(record_date: date) -> str:
+    return f"{record_date.year}{record_date.month:02d}"
 
 
 def parse_record_date(value) -> date | None:
@@ -355,9 +359,8 @@ def build_display_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return display_df
 
 
-def sheet_stored_attributes(record_date: date) -> tuple[int, str]:
-    _, month, _, month_week_label = get_month_week_info(record_date)
-    return month, month_week_label
+def sheet_stored_attributes(record_date: date) -> tuple[str, str]:
+    return format_year_month(record_date), get_month_week_info(record_date)[3]
 
 
 def derive_date_attributes(record_date: date) -> dict:
@@ -384,8 +387,8 @@ def _coalesce_sheet_value(row: pd.Series, column: str, fallback):
 def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         empty = pd.DataFrame(columns=SHEET_COLUMNS + INTERNAL_COLUMNS)
-        empty["월"] = empty["월"].astype("Int64")
         empty["연도"] = empty["연도"].astype("Int64")
+        empty["월"] = empty["월"].astype("Int64")
         empty["주차"] = empty["주차"].astype("Int64")
         empty["_sheet_row"] = empty["_sheet_row"].astype("Int64")
         return empty
@@ -403,6 +406,7 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if record_date is None:
             enriched_rows.append(
                 {
+                    "연월": "",
                     "월": pd.NA,
                     "월 주차": "",
                     "연도": pd.NA,
@@ -416,7 +420,10 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         computed = derive_date_attributes(record_date)
         enriched_rows.append(
             {
-                "월": _coalesce_sheet_value(row, "월", computed["월"]),
+                "연월": _coalesce_sheet_value(
+                    row, "연월", format_year_month(record_date)
+                ),
+                "월": computed["월"],
                 "월 주차": _coalesce_sheet_value(row, "월 주차", computed["월 주차"]),
                 "연도": computed["연도"],
                 "주차": computed["주차"],
@@ -432,7 +439,11 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     result["월"] = result["월"].astype("Int64")
     result["연도"] = result["연도"].astype("Int64")
     result["주차"] = result["주차"].astype("Int64")
-    result = result.sort_values("_sort_date", ascending=False, na_position="last")
+    result = result.sort_values(
+        ["_sort_date", "_sheet_row"],
+        ascending=[False, False],
+        na_position="last",
+    )
     return result.reset_index(drop=True)
 
 
@@ -474,6 +485,13 @@ def apply_record_filters(
     if selected_week is not None:
         filtered = filtered[filtered["주차"] == selected_week]
 
+    if not filtered.empty:
+        filtered = filtered.sort_values(
+            ["_sort_date", "_sheet_row"],
+            ascending=[False, False],
+            na_position="last",
+        ).reset_index(drop=True)
+
     return filtered
 
 
@@ -503,12 +521,12 @@ def _append_row_to_sheet(sheet_row: list) -> None:
         print(f"[Google Sheets] append_row failed: {exc}", flush=True)
 
 
-def _update_row_in_sheet(row_index: int, values: list[list[str]]) -> None:
+def _update_row_in_sheet(row_index: int, update_values: list[list[str]]) -> None:
     try:
         worksheet = get_worksheet()
         worksheet.update(
             f"E{row_index}:G{row_index}",
-            values,
+            update_values,
             value_input_option="USER_ENTERED",
         )
     except Exception as exc:
@@ -531,17 +549,22 @@ def _is_checkout_empty(value) -> bool:
 
 
 def is_text_area_enabled(df: pd.DataFrame) -> bool:
-    """최신 기록(_sheet_row 최대)의 퇴근시간 공란 여부로 입력창 활성화를 결정한다."""
-    if df.empty:
-        return False
-    latest = df.loc[df["_sheet_row"].idxmax()]
-    return _is_checkout_empty(latest["퇴근시간"])
+    """퇴근시간이 비어 있는 활성 출근 기록 존재 여부."""
+    return find_open_session_row(df) is not None
 
 
 def find_open_session_row(df: pd.DataFrame) -> pd.Series | None:
-    if not is_text_area_enabled(df):
+    if df.empty:
         return None
-    return df.loc[df["_sheet_row"].idxmax()]
+
+    open_sessions = df[
+        df["출근시간"].astype(str).str.strip().ne("")
+        & df["퇴근시간"].apply(_is_checkout_empty)
+    ]
+    if open_sessions.empty:
+        return None
+
+    return open_sessions.loc[open_sessions["_sheet_row"].idxmax()]
 
 
 def apply_clock_in(df: pd.DataFrame) -> tuple[pd.DataFrame, list] | None:
@@ -551,11 +574,11 @@ def apply_clock_in(df: pd.DataFrame) -> tuple[pd.DataFrame, list] | None:
 
     current = now_kst()
     today = today_kst()
-    month, month_week_label = sheet_stored_attributes(today)
+    year_month, month_week_label = sheet_stored_attributes(today)
     date_label = today_str()
     check_in = time_str(current)
     sheet_row = [
-        month,
+        year_month,
         month_week_label,
         date_label,
         check_in,
@@ -564,8 +587,8 @@ def apply_clock_in(df: pd.DataFrame) -> tuple[pd.DataFrame, list] | None:
         "",
     ]
 
-    new_sheet_row = int(df["_sheet_row"].max()) + 1 if not df.empty else 2
     new_record = dict(zip(SHEET_COLUMNS, sheet_row))
+    new_sheet_row = int(df["_sheet_row"].max()) + 1 if not df.empty else 2
     new_record["_sheet_row"] = new_sheet_row
 
     updated_df = pd.concat([df, pd.DataFrame([new_record])], ignore_index=True)
@@ -575,7 +598,7 @@ def apply_clock_in(df: pd.DataFrame) -> tuple[pd.DataFrame, list] | None:
 def apply_clock_out(df: pd.DataFrame, work_content: str) -> tuple[pd.DataFrame, int, list[list[str]]] | None:
     session_row = find_open_session_row(df)
     if session_row is None:
-        st.warning("오늘 출근 기록이 없습니다. 먼저 출근하기를 눌러주세요.")
+        st.warning("아직 출근 한 기록이 없습니다. 먼저 출근을 등록 해 주세요.")
         return None
 
     row_index = int(session_row["_sheet_row"])
@@ -782,12 +805,11 @@ def main():
     st.divider()
 
     # 구역 2: 요약
-    monthly_total, weekly_total, remaining_hours = calculate_metrics(filtered_df)
+    monthly_total, weekly_total, _ = calculate_metrics(filtered_df)
     monthly_minutes = work_value_to_minutes(monthly_total)
     weekly_minutes = work_value_to_minutes(weekly_total)
-    remaining_minutes = work_value_to_minutes(remaining_hours)
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    metric_col1, metric_col2 = st.columns(2)
     with metric_col1:
         st.metric(
             label="이번 달 총 누적 근무시간",
@@ -797,12 +819,6 @@ def main():
         st.metric(
             label="이번 주(화~월) 누적 근무시간",
             value=format_duration(weekly_minutes),
-        )
-    with metric_col3:
-        st.metric(
-            label="이번 주 8시간까지 남은 시간",
-            value=format_duration(remaining_minutes),
-            delta_color="inverse",
         )
 
     progress_ratio = min(weekly_minutes / WEEKLY_TARGET_MINUTES, 1.0)
@@ -822,39 +838,41 @@ def main():
     st.divider()
 
     # 구역 3: 액션
+    df = st.session_state[DF_SESSION_KEY]
+    is_working = is_text_area_enabled(df)
+
     action_col1, action_col2 = st.columns(2)
     with action_col1:
-        if st.button("출근하기", type="primary", use_container_width=True):
+        if st.button(
+            "출근하기",
+            type="primary",
+            use_container_width=True,
+            disabled=is_working,
+        ):
             result = apply_clock_in(df)
             if result is not None:
                 updated_df, sheet_row = result
+                _append_row_to_sheet(sheet_row)
                 st.session_state[DF_SESSION_KEY] = updated_df
-                threading.Thread(
-                    target=_append_row_to_sheet,
-                    args=(sheet_row,),
-                    daemon=True,
-                ).start()
                 st.rerun()
     with action_col2:
-        if st.button("퇴근하기", type="secondary", use_container_width=True):
+        if st.button(
+            "퇴근하기",
+            type="secondary",
+            use_container_width=True,
+            disabled=not is_working,
+        ):
             work_content = st.session_state.get(WORK_DETAIL_KEY, "")
             if not work_content or not work_content.strip():
-                st.error(
-                    "퇴근 처리가 거부되었습니다. 오늘 수행한 업무 상세를 반드시 입력해야 "
-                    "퇴근이 완료됩니다."
-                )
-                st.stop()
-            result = apply_clock_out(df, work_content)
-            if result is not None:
-                updated_df, row_index, update_values = result
-                st.session_state[DF_SESSION_KEY] = updated_df
-                st.session_state[WORK_DETAIL_KEY] = ""
-                threading.Thread(
-                    target=_update_row_in_sheet,
-                    args=(row_index, update_values),
-                    daemon=True,
-                ).start()
-                st.rerun()
+                st.warning("오늘 수행한 업무 상세를 반드시 입력해야 퇴근이 완료됩니다.")
+            else:
+                result = apply_clock_out(df, work_content)
+                if result is not None:
+                    updated_df, row_index, update_values = result
+                    _update_row_in_sheet(row_index, update_values)
+                    st.session_state[DF_SESSION_KEY] = updated_df
+                    st.session_state[WORK_DETAIL_KEY] = ""
+                    st.rerun()
 
     df = st.session_state[DF_SESSION_KEY]
     is_working = is_text_area_enabled(df)
