@@ -12,6 +12,7 @@ import streamlit as st
 KST = ZoneInfo("Asia/Seoul")
 SPREADSHEET_ID = "13T5pAuqmkF3QEYXSEf0L-cB-shDbp8X2-BBUfsdGl2s"
 WORKSHEET_NAME = "근무기록"
+MODIFICATION_REQUEST_WORKSHEET_NAME = "수정요청"
 WEEKLY_TARGET_HOURS = 8.0
 WEEKLY_TARGET_MINUTES = int(WEEKLY_TARGET_HOURS * 60)
 WORK_DETAIL_KEY = "work_detail_input"
@@ -50,6 +51,15 @@ DISPLAY_COLUMNS = [
 ]
 INTERNAL_COLUMNS = ["연도", "주차", "_week_start", "_sort_date", "_sheet_row"]
 SHEET_HEADER_RANGE = "A1:G1"
+MODIFICATION_REQUEST_COLUMNS = [
+    "요청 일시",
+    "대상 날짜",
+    "기존 출근시간",
+    "기존 퇴근시간",
+    "요청 내용",
+    "처리 상태",
+]
+MODIFICATION_REQUEST_HEADER_RANGE = "A1:F1"
 
 
 @st.cache_resource
@@ -83,6 +93,35 @@ def get_worksheet():
         worksheet.update(SHEET_HEADER_RANGE, [SHEET_COLUMNS])
 
     return worksheet
+
+
+@st.cache_resource
+def get_modification_request_worksheet():
+    client = get_gspread_client()
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+
+    try:
+        worksheet = spreadsheet.worksheet(MODIFICATION_REQUEST_WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=MODIFICATION_REQUEST_WORKSHEET_NAME,
+            rows=1000,
+            cols=len(MODIFICATION_REQUEST_COLUMNS),
+        )
+        worksheet.update(MODIFICATION_REQUEST_HEADER_RANGE, [MODIFICATION_REQUEST_COLUMNS])
+
+    return worksheet
+
+
+def ensure_modification_request_headers(worksheet) -> None:
+    rows = worksheet.get_all_values()
+    if not rows:
+        worksheet.update(MODIFICATION_REQUEST_HEADER_RANGE, [MODIFICATION_REQUEST_COLUMNS])
+        return
+
+    header = rows[0][: len(MODIFICATION_REQUEST_COLUMNS)]
+    if header != MODIFICATION_REQUEST_COLUMNS:
+        worksheet.update(MODIFICATION_REQUEST_HEADER_RANGE, [MODIFICATION_REQUEST_COLUMNS])
 
 
 def ensure_sheet_headers(worksheet, rows: list[list[str]]) -> None:
@@ -132,6 +171,22 @@ def today_str() -> str:
 
 def time_str(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
+
+
+def format_time_short(value) -> str:
+    if pd.isna(value) or not str(value).strip():
+        return "-"
+    text = str(value).strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    return text
+
+
+def request_datetime_str() -> str:
+    return now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_record_date(value) -> date | None:
@@ -460,6 +515,15 @@ def _update_row_in_sheet(row_index: int, values: list[list[str]]) -> None:
         print(f"[Google Sheets] update failed: {exc}", flush=True)
 
 
+def _append_modification_request_to_sheet(request_row: list) -> None:
+    try:
+        worksheet = get_modification_request_worksheet()
+        ensure_modification_request_headers(worksheet)
+        worksheet.append_row(request_row, value_input_option="USER_ENTERED")
+    except Exception as exc:
+        print(f"[Google Sheets] modification request append_row failed: {exc}", flush=True)
+
+
 def _is_checkout_empty(value) -> bool:
     if pd.isna(value):
         return True
@@ -622,6 +686,82 @@ def render_top_filters(df: pd.DataFrame) -> pd.DataFrame:
     return apply_record_filters(df, selected_year, selected_month, selected_week)
 
 
+def get_eligible_modification_records(filtered_df: pd.DataFrame) -> pd.DataFrame:
+    """필터 결과 중 날짜·출근시간이 있는 행만 반환한다."""
+    if filtered_df.empty:
+        return filtered_df
+
+    mask = (
+        filtered_df["날짜"].astype(str).str.strip().ne("")
+        & filtered_df["출근시간"].astype(str).str.strip().ne("")
+    )
+    return filtered_df[mask].copy()
+
+
+def format_record_option_label(row: pd.Series) -> str:
+    date_label = str(row["날짜"]).strip()
+    check_in = format_time_short(row["출근시간"])
+    check_out = format_time_short(row["퇴근시간"])
+    return f"{date_label} | 출근: {check_in} | 퇴근: {check_out}"
+
+
+def build_modification_record_options(filtered_df: pd.DataFrame) -> list[tuple[str, pd.Series]]:
+    eligible = get_eligible_modification_records(filtered_df)
+    if eligible.empty:
+        return []
+
+    options: list[tuple[str, pd.Series]] = []
+    label_counts: dict[str, int] = {}
+    for _, row in eligible.iterrows():
+        label = format_record_option_label(row)
+        label_counts[label] = label_counts.get(label, 0) + 1
+        if label_counts[label] > 1:
+            label = f"{label} · 기록 {int(row['_sheet_row'])}"
+        options.append((label, row))
+    return options
+
+
+def render_modification_request_form(filtered_df: pd.DataFrame) -> None:
+    with st.expander("📝 근무 기록 수정 요청 (관리자 승인)"):
+        record_options = build_modification_record_options(filtered_df)
+        if not record_options:
+            st.caption("현재 필터 조건에 수정 요청 가능한 근무 기록이 없습니다.")
+            return
+
+        labels = [label for label, _ in record_options]
+
+        with st.form("modification_request_form", clear_on_submit=True):
+            selected_label = st.selectbox(
+                "수정할 근무 기록 선택",
+                options=labels,
+            )
+            request_detail = st.text_area(
+                "수정 요청 상세 내용 (예: 퇴근 시간 23:00으로 변경 요청)",
+                height=100,
+            )
+            submitted = st.form_submit_button("요청 제출", type="primary", use_container_width=True)
+
+        if submitted:
+            if not request_detail or not request_detail.strip():
+                st.error("수정 요청 상세 내용을 입력해 주세요.")
+                return
+
+            selected_row = next(row for label, row in record_options if label == selected_label)
+            request_row = [
+                request_datetime_str(),
+                str(selected_row["날짜"]).strip(),
+                str(selected_row["출근시간"]).strip(),
+                "" if _is_checkout_empty(selected_row["퇴근시간"]) else str(selected_row["퇴근시간"]).strip(),
+                request_detail.strip(),
+                "대기중",
+            ]
+            threading.Thread(
+                target=_append_modification_request_to_sheet,
+                args=(request_row,),
+                daemon=True,
+            ).start()
+
+
 def main():
     st.set_page_config(page_title="근무 시간 통합 모니터링", layout="wide")
     st.title("근무 시간 통합 모니터링 시스템")
@@ -741,6 +881,8 @@ def main():
         use_container_width=True,
         hide_index=True,
     )
+
+    render_modification_request_form(filtered_df)
 
     if st.session_state.get(FALLBACK_TIME_KEY):
         st.caption("경고: 로컬 시간 기준 기록됨")
