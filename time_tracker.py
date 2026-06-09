@@ -1,3 +1,4 @@
+import io
 import os
 import threading
 from datetime import date, datetime, timedelta
@@ -23,6 +24,7 @@ FILTER_ANCHOR_KEY = "_filter_time_anchor"
 FILTER_YEAR_KEY = "filter_year"
 FILTER_MONTH_KEY = "filter_month"
 FILTER_WEEK_KEY = "filter_week"
+FILTER_WEEK_ALL = 0  # '전체' 선택 시 주차 필터 bypass용 정수 센티널
 SECRETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets.json")
 
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
@@ -357,6 +359,80 @@ def work_value_to_minutes(value) -> int:
     return int(round(parse_work_hours(value) * 60))
 
 
+def _format_week_filter_label(value: int | None) -> str:
+    """주차 selectbox 표시 — 내부값은 int/None 유지, UI만 라벨 변환."""
+    if value in (FILTER_WEEK_ALL, None):
+        return "All(전체)"
+    return f"{value}주차"
+
+
+def generate_excel_file(df: pd.DataFrame) -> bytes:
+    """필터된 근무 기록을 서식이 적용된 엑셀 바이트로 변환한다."""
+    export_df = build_display_dataframe(df)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        sheet_name = "근무기록"
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
+        workbook = writer.book
+        worksheet = writer.sheets[sheet_name]
+
+        header_format = workbook.add_format(
+            {
+                "bold": True,
+                "align": "center",
+                "valign": "vcenter",
+                "border": 1,
+                "text_wrap": True,
+            }
+        )
+        cell_center_format = workbook.add_format(
+            {
+                "align": "center",
+                "valign": "vcenter",
+                "border": 1,
+                "text_wrap": True,
+            }
+        )
+        cell_left_format = workbook.add_format(
+            {
+                "align": "left",
+                "valign": "vcenter",
+                "border": 1,
+                "text_wrap": True,
+            }
+        )
+
+        # 컬럼별 고정 너비 — 날짜/시간은 좁게, 업무 내용은 넓게
+        col_widths = {
+            "월 주차": 14,
+            "날짜": 22,
+            "출근시간": 12,
+            "퇴근시간": 12,
+            "당일 근무시간": 16,
+            "업무 내용": 65,
+        }
+        for col_idx, col_name in enumerate(export_df.columns):
+            worksheet.set_column(col_idx, col_idx, col_widths.get(col_name, 12))
+
+        worksheet.set_row(0, 22)
+        for row_idx, col_name in enumerate(export_df.columns):
+            worksheet.write(0, row_idx, col_name, header_format)
+
+        for row_idx in range(len(export_df)):
+            excel_row = row_idx + 1
+            for col_idx, col_name in enumerate(export_df.columns):
+                value = export_df.iloc[row_idx, col_idx]
+                if pd.isna(value):
+                    value = ""
+                cell_format = (
+                    cell_left_format if col_name == "업무 내용" else cell_center_format
+                )
+                worksheet.write(excel_row, col_idx, value, cell_format)
+
+    return output.getvalue()
+
+
 def build_display_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """화면 출력용 View-Model — st.session_state.df 원본은 건드리지 않는다."""
     display_df = df[DISPLAY_COLUMNS].copy()
@@ -491,7 +567,8 @@ def apply_record_filters(
         filtered = filtered[filtered["연도"] == selected_year]
     if selected_month is not None:
         filtered = filtered[filtered["월"] == selected_month]
-    if selected_week is not None:
+    # 0/None = 'All(전체)' — 주차 조건을 건너뛰고 선택된 연·월 전체를 반환
+    if selected_week is not None and selected_week != FILTER_WEEK_ALL:
         filtered = filtered[filtered["주차"] == selected_week]
 
     if not filtered.empty:
@@ -699,6 +776,8 @@ def render_top_filters(df: pd.DataFrame) -> pd.DataFrame:
             if selected_year == today_year and selected_month == today_month
             else 1
         ]
+    # 정수 0을 '전체' 센티널로 맨 앞에 추가 — int 타입 체계 유지
+    week_options = [FILTER_WEEK_ALL] + [w for w in week_options if w != FILTER_WEEK_ALL]
     preferred_week = (
         today_week
         if selected_year == today_year and selected_month == today_month
@@ -712,7 +791,7 @@ def render_top_filters(df: pd.DataFrame) -> pd.DataFrame:
             options=week_options,
             index=week_options.index(st.session_state[FILTER_WEEK_KEY]),
             key=FILTER_WEEK_KEY,
-            format_func=lambda value: f"{value}주차",
+            format_func=_format_week_filter_label,
         )
 
     return apply_record_filters(df, selected_year, selected_month, selected_week)
@@ -919,7 +998,28 @@ def main():
     st.divider()
 
     # 구역 4: 기록
-    st.subheader("📋 상세 근무 기록")
+    record_header_col, record_download_col = st.columns([6, 1])
+    with record_header_col:
+        st.subheader("📋 상세 근무 기록")
+    with record_download_col:
+        st.write("")
+        selected_year = st.session_state.get(FILTER_YEAR_KEY, "")
+        selected_month = st.session_state.get(FILTER_MONTH_KEY, "")
+        selected_week = st.session_state.get(FILTER_WEEK_KEY)
+        week_label = (
+            "전체"
+            if selected_week in (FILTER_WEEK_ALL, None)
+            else f"{selected_week}주차"
+        )
+        excel_filename = f"근무보고_{selected_year}_{selected_month:02d}_{week_label}.xlsx"
+        st.download_button(
+            label="EXCEL",
+            data=generate_excel_file(filtered_df),
+            file_name=excel_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/table_chart:",
+            use_container_width=True,
+        )
     st.dataframe(
         build_display_dataframe(filtered_df),
         use_container_width=True,
