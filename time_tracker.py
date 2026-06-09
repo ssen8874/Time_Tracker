@@ -8,6 +8,7 @@ import gspread
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_javascript import st_javascript
 
 KST = ZoneInfo("Asia/Seoul")
 SPREADSHEET_ID = "13T5pAuqmkF3QEYXSEf0L-cB-shDbp8X2-BBUfsdGl2s"
@@ -60,6 +61,14 @@ MODIFICATION_REQUEST_COLUMNS = [
     "처리 상태",
 ]
 MODIFICATION_REQUEST_HEADER_RANGE = "A1:F1"
+
+ALLOWED_OFFICE_IPS = ["220.85.161.253"]
+
+
+def get_client_ip():
+    # 브라우저 단에서 api.ipify.org를 호출하여 실제 외부 공인 IP를 가져옴
+    ip = st_javascript("await fetch('https://api.ipify.org?format=json').then(r => r.json()).then(d => d.ip)")
+    return ip
 
 
 @st.cache_resource
@@ -841,13 +850,28 @@ def main():
     df = st.session_state[DF_SESSION_KEY]
     is_working = is_text_area_enabled(df)
 
+    current_ip = get_client_ip()
+    if current_ip == 0:
+        st.info("보안 네트워크를 확인하고 있습니다...")
+        clock_in_disabled = True
+        clock_out_disabled = True
+    elif current_ip not in ALLOWED_OFFICE_IPS:
+        st.error(
+            f"🔒 지정된 사무실 네트워크(Wi-Fi)에서만 출퇴근이 가능합니다. (현재 접속 IP: {current_ip})"
+        )
+        clock_in_disabled = True
+        clock_out_disabled = True
+    else:
+        clock_in_disabled = is_working
+        clock_out_disabled = not is_working
+
     action_col1, action_col2 = st.columns(2)
     with action_col1:
         if st.button(
             "출근하기",
             type="primary",
             use_container_width=True,
-            disabled=is_working,
+            disabled=clock_in_disabled,
         ):
             result = apply_clock_in(df)
             if result is not None:
@@ -860,7 +884,7 @@ def main():
             "퇴근하기",
             type="secondary",
             use_container_width=True,
-            disabled=not is_working,
+            disabled=clock_out_disabled,
         ):
             work_content = st.session_state.get(WORK_DETAIL_KEY, "")
             if not work_content or not work_content.strip():
