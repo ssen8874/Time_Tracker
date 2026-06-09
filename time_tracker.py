@@ -61,19 +61,6 @@ MODIFICATION_REQUEST_COLUMNS = [
 ]
 MODIFICATION_REQUEST_HEADER_RANGE = "A1:F1"
 
-ALLOWED_OFFICE_IPS = ["127.0.0.1", "106.251.83.219"]
-
-
-def get_client_ip():
-    try:
-        # Streamlit 클라우드 환경의 헤더에서 추출
-        headers = st.context.headers
-        if "X-Forwarded-For" in headers:
-            return headers.get("X-Forwarded-For").split(",")[0].strip()
-    except Exception:
-        pass
-    return "Unknown IP"
-
 
 @st.cache_resource
 def get_gspread_client():
@@ -854,20 +841,13 @@ def main():
     df = st.session_state[DF_SESSION_KEY]
     is_working = is_text_area_enabled(df)
 
-    current_ip = get_client_ip()
-    is_allowed_ip = current_ip in ALLOWED_OFFICE_IPS
-    if not is_allowed_ip:
-        st.error(
-            f"🔒 지정된 사무실 네트워크(Wi-Fi)에서만 출퇴근이 가능합니다. (현재 접속 IP: {current_ip})"
-        )
-
     action_col1, action_col2 = st.columns(2)
     with action_col1:
         if st.button(
             "출근하기",
             type="primary",
             use_container_width=True,
-            disabled=is_working or not is_allowed_ip,
+            disabled=is_working,
         ):
             result = apply_clock_in(df)
             if result is not None:
@@ -880,7 +860,7 @@ def main():
             "퇴근하기",
             type="secondary",
             use_container_width=True,
-            disabled=not is_working or not is_allowed_ip,
+            disabled=not is_working,
         ):
             work_content = st.session_state.get(WORK_DETAIL_KEY, "")
             if not work_content or not work_content.strip():
