@@ -279,7 +279,7 @@ def _sync_time_aware_filter_defaults(today_year: int, today_month: int, today_we
     st.session_state[FILTER_ANCHOR_KEY] = anchor
     st.session_state[FILTER_YEAR_KEY] = today_year
     st.session_state[FILTER_MONTH_KEY] = today_month
-    st.session_state[FILTER_WEEK_KEY] = today_week
+    st.session_state[FILTER_WEEK_KEY] = FILTER_WEEK_ALL
 
 
 def _ensure_selectbox_value(key: str, options: list[int], preferred: int) -> None:
@@ -587,12 +587,28 @@ def sum_work_hours(df: pd.DataFrame) -> float:
     return float(df["당일 근무시간"].apply(parse_work_hours).sum())
 
 
-def calculate_metrics(filtered_df: pd.DataFrame) -> tuple[float, float, float]:
-    current_week_start = pd.Timestamp(get_tuesday_week_start(today_kst()))
+def calculate_metrics(
+    df: pd.DataFrame,
+    selected_year: int,
+    selected_month: int,
+    selected_week: int | None,
+) -> tuple[float, float, float]:
+    # 원본 df에서 연·월만 필터 — 주차 선택과 무관하게 해당 월 전체 누적
+    monthly_df = df[(df["연도"] == selected_year) & (df["월"] == selected_month)]
+    monthly_total = sum_work_hours(monthly_df)
 
-    monthly_total = sum_work_hours(filtered_df)
+    if selected_week is None or selected_week == FILTER_WEEK_ALL:
+        # 조건 A: 월 전체 조회 — 현실 시점 기준 진행 중인 이번 주 합산
+        current_week_start = pd.Timestamp(get_tuesday_week_start(today_kst()))
+        week_df = df[df["_week_start"] == current_week_start]
+    else:
+        # 조건 B: 특정 주차 선택 — 해당 연·월·주차 데이터만 합산
+        week_df = df[
+            (df["연도"] == selected_year)
+            & (df["월"] == selected_month)
+            & (df["주차"] == selected_week)
+        ]
 
-    week_df = filtered_df[filtered_df["_week_start"] == current_week_start]
     weekly_total = sum_work_hours(week_df)
     remaining_hours = max(WEEKLY_TARGET_HOURS - weekly_total, 0.0)
 
@@ -778,11 +794,7 @@ def render_top_filters(df: pd.DataFrame) -> pd.DataFrame:
         ]
     # 정수 0을 '전체' 센티널로 맨 앞에 추가 — int 타입 체계 유지
     week_options = [FILTER_WEEK_ALL] + [w for w in week_options if w != FILTER_WEEK_ALL]
-    preferred_week = (
-        today_week
-        if selected_year == today_year and selected_month == today_month
-        else week_options[-1]
-    )
+    preferred_week = FILTER_WEEK_ALL
     _ensure_selectbox_value(FILTER_WEEK_KEY, week_options, preferred_week)
 
     with filter_col3:
@@ -893,7 +905,14 @@ def main():
     st.divider()
 
     # 구역 2: 요약
-    monthly_total, weekly_total, _ = calculate_metrics(filtered_df)
+    # 구역 1 selectbox가 FILTER_YEAR_KEY·FILTER_MONTH_KEY를 widget key로 관리하므로
+    # 여기서는 읽기만 수행 — 별도 session state 쓰기 없음, rerun 라이프사이클 충돌 없음
+    selected_year = st.session_state[FILTER_YEAR_KEY]
+    selected_month = st.session_state[FILTER_MONTH_KEY]
+    selected_week = st.session_state[FILTER_WEEK_KEY]
+    monthly_total, weekly_total, _ = calculate_metrics(
+        df, selected_year, selected_month, selected_week
+    )
     monthly_minutes = work_value_to_minutes(monthly_total)
     weekly_minutes = work_value_to_minutes(weekly_total)
 
